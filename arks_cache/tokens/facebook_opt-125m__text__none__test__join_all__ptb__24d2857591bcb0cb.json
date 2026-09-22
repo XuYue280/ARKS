@@ -1,0 +1,16 @@
+{
+  "key": {
+    "model_id": "facebook/opt-125m",
+    "dataset": "text",
+    "config": null,
+    "split": "test",
+    "variant": "join_all__ptb",
+    "data_files": "https://raw.githubusercontent.com/wojzaremba/lstm/master/data/ptb.test.txt",
+    "tokenizer_class": "GPT2Tokenizer",
+    "name_or_path": "facebook/opt-125m",
+    "vocab_size": 50265,
+    "transformers": "4.57.6"
+  },
+  "numel": 97722,
+  "tokenize_seconds": 0.4604597560246475
+}
