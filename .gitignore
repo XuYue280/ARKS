@@ -51,3 +51,7 @@ core.*
 *.orig
 *.pre_*
 .probe_*.py
+
+# Claude Code session state -- tool config, not project source. It was hidden
+# inside the nested repo until the gitlink was flattened.
+.claude/
