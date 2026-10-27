@@ -1,0 +1,7 @@
+numpy>=1.26
+scikit-learn>=1.4
+torch>=2.4
+transformers>=4.45
+datasets>=2.20
+accelerate>=0.34
+zstandard>=0.23.0

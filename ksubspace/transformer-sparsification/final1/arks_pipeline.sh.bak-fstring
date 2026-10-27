@@ -1,0 +1,720 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# ARKS single-command pipeline
+#
+#   arks_pipeline.sh --model facebook/opt-125m --experiments all --seed 0 \
+#       --output-dir /path/to/runs --cache-dir /path/to/cache
+#
+# Runs: model download -> weight export -> rank profiling -> rank allocation
+#       -> per-experiment compression -> codebook calibration -> inference
+#       -> adaptive coefficient sparsity -> summary.
+#
+# Every stage is checkpointed. Re-running the same command resumes after the
+# last completed stage; a stage is redone only when its configuration, code
+# or upstream inputs changed. Hardware-dependent execution settings are
+# chosen automatically, printed, and saved to plan.json; each can be
+# overridden on the command line. See --help.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# ----------------------------------------------------------------- defaults
+MODEL="facebook/opt-125m"
+EXPERIMENTS="all"
+SEED=0
+OUTPUT_DIR=""
+CACHE_DIR=""
+RUN_TAG=""
+PYTHON=""
+FORCE=""
+DRY_RUN=0
+HF_REVISION=""
+
+# K-subspaces / rank allocation (experiment definition, never auto-changed)
+K=512
+BASE_RANK=4
+MAX_RANK=6
+EXTRA_BUDGET_MB=""
+C=8
+TILE_WIDTH=1
+SAMPLE_SIZE=50000
+ITERATIONS=15
+BATCH_SIZE=2048
+SELECTION_POOL=100
+RANK_CALIBRATION_SAMPLES=4
+RANK_CALIBRATION_SEQLEN=256
+
+# Coefficient VQ
+CODEBOOK_SIZE=65536
+VQ_STAGES=1
+VQ_SAMPLE_SIZE=0
+
+# Codebook calibration (same defaults as run_final.sh)
+CALIBRATION_SAMPLES=32
+CALIBRATION_SEQLEN=2048
+CALIBRATION_EPOCHS=10
+CALIBRATION_BATCH_SIZE=32
+CALIBRATION_EARLY_STOP=3
+CALIBRATION_STEPS=0
+CALIBRATION_LR=3e-5
+CALIBRATION_VALIDATION_SAMPLES=8
+CALIBRATION_REASSIGN_EVERY=0
+CALIBRATION_REASSIGN_BATCH_SIZE=4096
+CALIBRATION_MAX_COEFFICIENT_MSE_RATIO=1.01
+CALIBRATION_SEQUENTIAL_INPUTS=1
+CALIBRATION_PPL_GUARD_SAMPLES=4
+CALIBRATION_PPL_GUARD_SEQLEN=2048
+CALIBRATION_PPL_GUARD_SPLIT=validation
+CALIBRATION_PPL_GUARD_TOLERANCE=0.0
+
+# Adaptive coefficient sparsity
+SENSITIVE_COEFF_SPARSITY=0.20
+ROBUST_COEFF_SPARSITY=0.35
+SPARSITY_SOURCE=fp16
+COEFF_SPARSITY_OVERRIDES=""
+SENSITIVE_MATRICES=""
+
+# Inference
+INFERENCE_SEQLEN=2048
+MAX_PPL_SAMPLES=0
+
+# Execution settings: "auto" values are chosen from the detected hardware.
+DEVICE=auto
+WORKERS=0
+THREADS_PER_WORKER=auto
+LOSS_CHUNK_TOKENS=auto
+MODEL_STAGING=auto
+CALIBRATION_STREAMING=auto
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") --model MODEL [options]
+
+Selection
+  --model ID                    HuggingFace model id (OPT or Llama family)
+  --experiments LIST            all | comma list of fp16,int8,vq_nocalib,vq_calibrated,sparsity
+  --seed N                      seed for compression, allocation and calibration (default 0)
+  --output-dir DIR              run outputs (default: $REPO_ROOT/arks_runs)
+  --cache-dir DIR               downloads, exported weights, token and PPL caches
+                                (default: $REPO_ROOT/arks_cache)
+  --run-tag TAG                 extra suffix for the run directory
+  --force LIST                  redo stages: all,fetch,export,profile,allocate,compress,calibrate,inference,sparsity
+  --dry-run                     print the plan and stage status only
+  --python PATH                 interpreter (default: \$VIRTUAL_ENV or $REPO_ROOT/.venv)
+
+Experiment definition (defaults reproduce the published OPT-125M settings)
+  --k N --base-rank N --max-rank N --extra-budget-mb X --C N --tile-width N
+  --sample-size N --iterations N --batch-size N --selection-pool N
+  --rank-calibration-samples N --rank-calibration-seqlen N
+  --codebook-size N --vq-stages N --vq-sample-size N
+  --calibration-samples N --calibration-seqlen N --calibration-epochs N
+  --calibration-batch-size N --calibration-early-stop N --calibration-steps N
+  --calibration-lr X --calibration-validation-samples N
+  --calibration-reassign-every N --calibration-max-coefficient-mse-ratio X
+  --calibration-ppl-guard-samples N --calibration-ppl-guard-seqlen N
+  --calibration-ppl-guard-split S --calibration-ppl-guard-tolerance X
+  --sensitive-sparsity X --robust-sparsity X --sparsity-source fp16|int8
+  --coeff-sparsity-overrides "name=x ..." --sensitive-matrices "name ..."
+  --inference-seqlen N --max-ppl-samples N (0 = full WikiText-2 test set)
+
+Execution settings (auto-detected, printed and logged, overridable)
+  --device auto|cuda|cpu        --workers N (compression processes)
+  --threads-per-worker auto|N|legacy  (legacy = library default threads, one process;
+                                reproduces the original sequential scripts bit-for-bit)
+  --loss-chunk-tokens auto|N    (0 = single pass)
+  --model-staging auto|cuda|cpu --calibration-streaming auto|on|off
+EOF
+}
+
+# ------------------------------------------------------------ parse args
+while [[ $# -gt 0 ]]; do
+  arg="$1"; shift
+  value=""
+  if [[ "$arg" == --*=* ]]; then value="${arg#*=}"; arg="${arg%%=*}"; has_value=1; else has_value=0; fi
+  need() { if [[ $has_value -eq 0 ]]; then [[ $# -gt 0 ]] || { echo "Missing value for $arg" >&2; exit 2; }; fi; }
+  take() { if [[ $has_value -eq 1 ]]; then echo "$value"; else echo "$1"; fi; }
+  case "$arg" in
+    -h|--help) usage; exit 0 ;;
+    --dry-run) DRY_RUN=1; continue ;;
+    --model) need "$@"; MODEL=$(take "$@") ;;
+    --experiments) need "$@"; EXPERIMENTS=$(take "$@") ;;
+    --seed) need "$@"; SEED=$(take "$@") ;;
+    --output-dir) need "$@"; OUTPUT_DIR=$(take "$@") ;;
+    --cache-dir) need "$@"; CACHE_DIR=$(take "$@") ;;
+    --run-tag) need "$@"; RUN_TAG=$(take "$@") ;;
+    --python) need "$@"; PYTHON=$(take "$@") ;;
+    --force) need "$@"; FORCE=$(take "$@") ;;
+    --hf-revision) need "$@"; HF_REVISION=$(take "$@") ;;
+    --k) need "$@"; K=$(take "$@") ;;
+    --base-rank) need "$@"; BASE_RANK=$(take "$@") ;;
+    --max-rank) need "$@"; MAX_RANK=$(take "$@") ;;
+    --extra-budget-mb) need "$@"; EXTRA_BUDGET_MB=$(take "$@") ;;
+    --C|--tile-height) need "$@"; C=$(take "$@") ;;
+    --tile-width) need "$@"; TILE_WIDTH=$(take "$@") ;;
+    --sample-size) need "$@"; SAMPLE_SIZE=$(take "$@") ;;
+    --iterations) need "$@"; ITERATIONS=$(take "$@") ;;
+    --batch-size) need "$@"; BATCH_SIZE=$(take "$@") ;;
+    --selection-pool) need "$@"; SELECTION_POOL=$(take "$@") ;;
+    --rank-calibration-samples) need "$@"; RANK_CALIBRATION_SAMPLES=$(take "$@") ;;
+    --rank-calibration-seqlen) need "$@"; RANK_CALIBRATION_SEQLEN=$(take "$@") ;;
+    --codebook-size) need "$@"; CODEBOOK_SIZE=$(take "$@") ;;
+    --vq-stages) need "$@"; VQ_STAGES=$(take "$@") ;;
+    --vq-sample-size) need "$@"; VQ_SAMPLE_SIZE=$(take "$@") ;;
+    --calibration-samples) need "$@"; CALIBRATION_SAMPLES=$(take "$@") ;;
+    --calibration-seqlen) need "$@"; CALIBRATION_SEQLEN=$(take "$@") ;;
+    --calibration-epochs) need "$@"; CALIBRATION_EPOCHS=$(take "$@") ;;
+    --calibration-batch-size) need "$@"; CALIBRATION_BATCH_SIZE=$(take "$@") ;;
+    --calibration-early-stop) need "$@"; CALIBRATION_EARLY_STOP=$(take "$@") ;;
+    --calibration-steps) need "$@"; CALIBRATION_STEPS=$(take "$@") ;;
+    --calibration-lr) need "$@"; CALIBRATION_LR=$(take "$@") ;;
+    --calibration-validation-samples) need "$@"; CALIBRATION_VALIDATION_SAMPLES=$(take "$@") ;;
+    --calibration-reassign-every) need "$@"; CALIBRATION_REASSIGN_EVERY=$(take "$@") ;;
+    --calibration-reassign-batch-size) need "$@"; CALIBRATION_REASSIGN_BATCH_SIZE=$(take "$@") ;;
+    --calibration-max-coefficient-mse-ratio) need "$@"; CALIBRATION_MAX_COEFFICIENT_MSE_RATIO=$(take "$@") ;;
+    --calibration-sequential-inputs) need "$@"; CALIBRATION_SEQUENTIAL_INPUTS=$(take "$@") ;;
+    --calibration-ppl-guard-samples) need "$@"; CALIBRATION_PPL_GUARD_SAMPLES=$(take "$@") ;;
+    --calibration-ppl-guard-seqlen) need "$@"; CALIBRATION_PPL_GUARD_SEQLEN=$(take "$@") ;;
+    --calibration-ppl-guard-split) need "$@"; CALIBRATION_PPL_GUARD_SPLIT=$(take "$@") ;;
+    --calibration-ppl-guard-tolerance) need "$@"; CALIBRATION_PPL_GUARD_TOLERANCE=$(take "$@") ;;
+    --sensitive-sparsity) need "$@"; SENSITIVE_COEFF_SPARSITY=$(take "$@") ;;
+    --robust-sparsity) need "$@"; ROBUST_COEFF_SPARSITY=$(take "$@") ;;
+    --sparsity-source) need "$@"; SPARSITY_SOURCE=$(take "$@") ;;
+    --coeff-sparsity-overrides) need "$@"; COEFF_SPARSITY_OVERRIDES=$(take "$@") ;;
+    --sensitive-matrices) need "$@"; SENSITIVE_MATRICES=$(take "$@") ;;
+    --inference-seqlen) need "$@"; INFERENCE_SEQLEN=$(take "$@") ;;
+    --max-ppl-samples) need "$@"; MAX_PPL_SAMPLES=$(take "$@") ;;
+    --device) need "$@"; DEVICE=$(take "$@") ;;
+    --workers) need "$@"; WORKERS=$(take "$@") ;;
+    --threads-per-worker) need "$@"; THREADS_PER_WORKER=$(take "$@") ;;
+    --loss-chunk-tokens) need "$@"; LOSS_CHUNK_TOKENS=$(take "$@") ;;
+    --model-staging) need "$@"; MODEL_STAGING=$(take "$@") ;;
+    --calibration-streaming) need "$@"; CALIBRATION_STREAMING=$(take "$@") ;;
+    *) echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
+  esac
+  [[ $has_value -eq 1 ]] || shift
+done
+
+# ------------------------------------------------------- derived settings
+MODEL_TAG="${MODEL##*/}"
+OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/arks_runs}"
+CACHE_DIR="${CACHE_DIR:-$REPO_ROOT/arks_cache}"
+RUN_DIR="$OUTPUT_DIR/$MODEL_TAG/seed_${SEED}${RUN_TAG:+_$RUN_TAG}"
+MODEL_CACHE="$CACHE_DIR/models/$MODEL_TAG"
+WEIGHT_DIR="$MODEL_CACHE/weights"
+TOKEN_CACHE="$CACHE_DIR/tokens"
+DENSE_PPL_CACHE="$MODEL_CACHE/dense_ppl.json"
+STALE_DIR="$RUN_DIR/stale"
+
+if [[ -z "$PYTHON" ]]; then
+  if [[ -n "${VIRTUAL_ENV:-}" && -x "$VIRTUAL_ENV/bin/python" ]]; then PYTHON="$VIRTUAL_ENV/bin/python"
+  elif [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then PYTHON="$REPO_ROOT/.venv/bin/python"
+  elif [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then PYTHON="$SCRIPT_DIR/.venv/bin/python"
+  elif [[ -x "$REPO_ROOT/transformer-sparsification/.venv/bin/python" ]]; then PYTHON="$REPO_ROOT/transformer-sparsification/.venv/bin/python"
+  else PYTHON="$(command -v python3 || command -v python)"; fi
+fi
+
+if [[ -z "$EXTRA_BUDGET_MB" ]]; then
+  case "$MODEL_TAG" in
+    opt-125m) EXTRA_BUDGET_MB=1.88 ;;
+    Llama-3.2-1B) EXTRA_BUDGET_MB=64.06 ;;
+    *)
+      echo "--extra-budget-mb is required for $MODEL (published values: opt-125m=1.88, Llama-3.2-1B=64.06)." >&2
+      exit 2 ;;
+  esac
+fi
+
+case "$CODEBOOK_SIZE" in
+  16) VQ_COEFFICIENT_BITS=4 ;;
+  256) VQ_COEFFICIENT_BITS=8 ;;
+  65536) VQ_COEFFICIENT_BITS=16 ;;
+  *) echo "Unsupported --codebook-size $CODEBOOK_SIZE (use 16, 256 or 65536)." >&2; exit 2 ;;
+esac
+
+if [[ "$EXPERIMENTS" == "all" ]]; then
+  EXPERIMENTS="fp16,int8,vq_nocalib,vq_calibrated,sparsity"
+fi
+IFS=',' read -r -a EXPERIMENT_LIST <<< "$EXPERIMENTS"
+for experiment in "${EXPERIMENT_LIST[@]}"; do
+  case "$experiment" in
+    fp16|int8|vq_nocalib|vq_calibrated|sparsity) ;;
+    *) echo "Unknown experiment '$experiment'." >&2; exit 2 ;;
+  esac
+done
+has_experiment() { local e; for e in "${EXPERIMENT_LIST[@]}"; do [[ "$e" == "$1" ]] && return 0; done; return 1; }
+if [[ "$SPARSITY_SOURCE" != "fp16" && "$SPARSITY_SOURCE" != "int8" ]]; then
+  echo "--sparsity-source must be fp16 or int8." >&2; exit 2
+fi
+
+experiment_dir() {
+  case "$1" in
+    fp16) echo "$RUN_DIR/adaptive_baseline_fp16" ;;
+    int8) echo "$RUN_DIR/adaptive_baseline_int8" ;;
+    vq_nocalib) echo "$RUN_DIR/adaptive_vq_nocalib" ;;
+    vq_calibrated) echo "$RUN_DIR/adaptive_vq_calibrated" ;;
+    sparsity) echo "$RUN_DIR/adaptive_sparsity" ;;
+  esac
+}
+experiment_representation() { case "$1" in fp16|int8) echo scalar ;; *) echo vq ;; esac; }
+experiment_bits() { case "$1" in fp16) echo 16 ;; int8) echo 8 ;; *) echo "$VQ_COEFFICIENT_BITS" ;; esac; }
+
+mkdir -p "$RUN_DIR/logs" "$MODEL_CACHE" "$TOKEN_CACHE"
+LOG_FILE="$RUN_DIR/logs/run_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "ARKS pipeline started $(date)"
+echo "Command: $0 $*"
+echo "Log: $LOG_FILE"
+
+export ARKS_TOKEN_CACHE="$TOKEN_CACHE"
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+
+# ---------------------------------------------------------- stage helpers
+force_matches() {
+  local stage="$1" item
+  [[ -z "$FORCE" ]] && return 1
+  IFS=',' read -r -a items <<< "$FORCE"
+  for item in "${items[@]}"; do
+    [[ "$item" == "all" || "$item" == "$stage" || "$stage" == "$item"_* || "$stage" == *_"$item" ]] && return 0
+  done
+  return 1
+}
+
+hash_of() { printf '%s' "$*" | sha256sum | cut -c1-16; }
+code_hash() { cat "$@" | sha256sum | cut -c1-16; }
+stamp_get() { "$PYTHON" "$SCRIPT_DIR/arks_stamp.py" get "$1" "$2"; }
+stamp_hash() { local h; h=$(stamp_get "$1" hash); [[ -n "$h" ]] && echo "$h" || echo "missing"; }
+
+declare -A STAGE_STATUS
+# run_stage NAME DIR HASH FUNCTION [INPUT_DESCRIPTION]
+run_stage() {
+  local name="$1" dir="$2" hash="$3" fn="$4" inputs="${5:-}"
+  local started elapsed
+  if ! force_matches "$name" && "$PYTHON" "$SCRIPT_DIR/arks_stamp.py" check "$dir" "$hash"; then
+    echo "[skip] $name: complete (hash $hash) in $dir"
+    STAGE_STATUS[$name]="skipped"
+    return 0
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[plan] $name: would run (hash $hash) -> $dir"
+    STAGE_STATUS[$name]="pending"
+    return 0
+  fi
+  if [[ -d "$dir" ]] && [[ -n "$(ls -A "$dir" 2>/dev/null)" ]]; then
+    local stale="$STALE_DIR/${name}_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$STALE_DIR"
+    echo "[stale] $name: moving previous contents to $stale"
+    mv "$dir" "$stale"
+  fi
+  mkdir -p "$dir"
+  "$PYTHON" "$SCRIPT_DIR/arks_stamp.py" begin "$dir" --stage "$name" --hash "$hash" --inputs "$inputs"
+  echo "[run] $name (hash $hash) -> $dir"
+  started=$(date +%s)
+  "$fn"
+  elapsed=$(( $(date +%s) - started ))
+  "$PYTHON" "$SCRIPT_DIR/arks_stamp.py" finish "$dir" --extra "wallclock_seconds=$elapsed"
+  echo "[done] $name in ${elapsed}s"
+  STAGE_STATUS[$name]="ran (${elapsed}s)"
+}
+
+find_config_dir() {
+  local root="$1" pattern="$2"
+  mapfile -t candidates < <(find "$root" -mindepth 1 -maxdepth 1 -type d -name "$pattern")
+  if [[ "${#candidates[@]}" -ne 1 ]]; then
+    echo "Expected exactly one artifact directory matching $pattern in $root; found ${#candidates[@]}" >&2
+    printf '%s\n' "${candidates[@]}" >&2
+    return 1
+  fi
+  echo "${candidates[0]}"
+}
+
+# ---------------------------------------------------- hardware and plan
+echo
+echo "== Hardware and model detection =="
+"$PYTHON" "$SCRIPT_DIR/arks_common.py" hardware > "$RUN_DIR/hardware.json"
+"$PYTHON" "$SCRIPT_DIR/arks_common.py" model --model "$MODEL" > "$RUN_DIR/model_info.json"
+case "$THREADS_PER_WORKER" in
+  auto) PLAN_THREAD_ARGS=(--threads-per-worker 0) ;;
+  legacy) PLAN_THREAD_ARGS=(--threads-per-worker 0 --legacy-threads) ;;
+  *) PLAN_THREAD_ARGS=(--threads-per-worker "$THREADS_PER_WORKER") ;;
+esac
+"$PYTHON" "$SCRIPT_DIR/arks_plan.py" \
+  --hardware-json "$RUN_DIR/hardware.json" --model-json "$RUN_DIR/model_info.json" \
+  --plan-json "$RUN_DIR/plan.json" \
+  --device "$DEVICE" --workers "$WORKERS" "${PLAN_THREAD_ARGS[@]}" \
+  --loss-chunk-tokens "$LOSS_CHUNK_TOKENS" --model-staging "$MODEL_STAGING" \
+  --calibration-streaming "$CALIBRATION_STREAMING" \
+  --inference-seqlen "$INFERENCE_SEQLEN" --rank-calibration-seqlen "$RANK_CALIBRATION_SEQLEN" \
+  --calibration-samples "$CALIBRATION_SAMPLES" --calibration-seqlen "$CALIBRATION_SEQLEN" \
+  --max-rank "$MAX_RANK" > "$RUN_DIR/plan.env"
+# shellcheck disable=SC1090
+source "$RUN_DIR/plan.env"
+EXPECTED_MATRICES=$("$PYTHON" -c "import json,sys;print(json.load(open(sys.argv[1]))['expected_matrices'])" "$RUN_DIR/model_info.json")
+"$PYTHON" - "$RUN_DIR/plan.json" "$RUN_DIR/model_info.json" "$RUN_DIR/hardware.json" <<'PY'
+import json, sys
+plan = json.load(open(sys.argv[1])); model = json.load(open(sys.argv[2])); hw = json.load(open(sys.argv[3]))
+gpu = hw["gpus"][0] if hw.get("gpus") else None
+print(f"  CPU cores usable: {hw['cpu_usable']}   RAM: {hw['ram_available_bytes']/2**30:.1f} GiB available of {hw['ram_total_bytes']/2**30:.1f} GiB")
+print(f"  GPU: {gpu['name'] + f' ({gpu['vram_free_bytes']/2**30:.1f} GiB free of {gpu['vram_total_bytes']/2**30:.1f} GiB)' if gpu else 'none'}")
+print(f"  Model: {model['model_id']}  family={model['family']}  layers={model['num_layers']}  hidden={model['hidden_size']}  vocab={model['vocab_size']}  matrices={model['expected_matrices']}  est. params={plan['ESTIMATED_PARAMS']/1e6:.0f}M")
+print("  Execution settings (auto unless overridden):")
+for key in ("DEVICE","WORKERS","THREADS_PER_WORKER","LOSS_CHUNK_TOKENS","MODEL_STAGING","CALIBRATION_STREAMING"):
+    print(f"    {key:<24}= {plan[key]!s:<8}  # {plan['REASONS'][key]}")
+for w in plan["WARNINGS"]: print(f"  WARNING: {w}")
+for e in plan["ERRORS"]: print(f"  ERROR: {e}")
+if plan["ERRORS"]: sys.exit(3)
+PY
+
+echo
+echo "== Run configuration =="
+cat <<EOF | tee "$RUN_DIR/config.env"
+MODEL=$MODEL
+MODEL_TAG=$MODEL_TAG
+EXPERIMENTS=$EXPERIMENTS
+SEED=$SEED
+RUN_DIR=$RUN_DIR
+CACHE_DIR=$CACHE_DIR
+PYTHON=$PYTHON
+K=$K
+BASE_RANK=$BASE_RANK
+MAX_RANK=$MAX_RANK
+EXTRA_BUDGET_MB=$EXTRA_BUDGET_MB
+C=$C
+TILE_WIDTH=$TILE_WIDTH
+SAMPLE_SIZE=$SAMPLE_SIZE
+ITERATIONS=$ITERATIONS
+BATCH_SIZE=$BATCH_SIZE
+SELECTION_POOL=$SELECTION_POOL
+RANK_CALIBRATION_SAMPLES=$RANK_CALIBRATION_SAMPLES
+RANK_CALIBRATION_SEQLEN=$RANK_CALIBRATION_SEQLEN
+CODEBOOK_SIZE=$CODEBOOK_SIZE
+VQ_STAGES=$VQ_STAGES
+VQ_SAMPLE_SIZE=$VQ_SAMPLE_SIZE
+VQ_COEFFICIENT_BITS=$VQ_COEFFICIENT_BITS
+CALIBRATION_SAMPLES=$CALIBRATION_SAMPLES
+CALIBRATION_SEQLEN=$CALIBRATION_SEQLEN
+CALIBRATION_EPOCHS=$CALIBRATION_EPOCHS
+CALIBRATION_BATCH_SIZE=$CALIBRATION_BATCH_SIZE
+CALIBRATION_EARLY_STOP=$CALIBRATION_EARLY_STOP
+CALIBRATION_STEPS=$CALIBRATION_STEPS
+CALIBRATION_LR=$CALIBRATION_LR
+CALIBRATION_VALIDATION_SAMPLES=$CALIBRATION_VALIDATION_SAMPLES
+CALIBRATION_REASSIGN_EVERY=$CALIBRATION_REASSIGN_EVERY
+CALIBRATION_REASSIGN_BATCH_SIZE=$CALIBRATION_REASSIGN_BATCH_SIZE
+CALIBRATION_MAX_COEFFICIENT_MSE_RATIO=$CALIBRATION_MAX_COEFFICIENT_MSE_RATIO
+CALIBRATION_SEQUENTIAL_INPUTS=$CALIBRATION_SEQUENTIAL_INPUTS
+CALIBRATION_PPL_GUARD_SAMPLES=$CALIBRATION_PPL_GUARD_SAMPLES
+CALIBRATION_PPL_GUARD_SEQLEN=$CALIBRATION_PPL_GUARD_SEQLEN
+CALIBRATION_PPL_GUARD_SPLIT=$CALIBRATION_PPL_GUARD_SPLIT
+CALIBRATION_PPL_GUARD_TOLERANCE=$CALIBRATION_PPL_GUARD_TOLERANCE
+SENSITIVE_COEFF_SPARSITY=$SENSITIVE_COEFF_SPARSITY
+ROBUST_COEFF_SPARSITY=$ROBUST_COEFF_SPARSITY
+SPARSITY_SOURCE=$SPARSITY_SOURCE
+COEFF_SPARSITY_OVERRIDES=$COEFF_SPARSITY_OVERRIDES
+SENSITIVE_MATRICES=$SENSITIVE_MATRICES
+INFERENCE_SEQLEN=$INFERENCE_SEQLEN
+MAX_PPL_SAMPLES=$MAX_PPL_SAMPLES
+DEVICE=$DEVICE
+WORKERS=$WORKERS
+THREADS_PER_WORKER=$THREADS_PER_WORKER
+LOSS_CHUNK_TOKENS=$LOSS_CHUNK_TOKENS
+MODEL_STAGING=$MODEL_STAGING
+CALIBRATION_STREAMING=$CALIBRATION_STREAMING
+EXPECTED_MATRICES=$EXPECTED_MATRICES
+FORCE=$FORCE
+EOF
+
+COMPRESS_CODE=$(code_hash "$SCRIPT_DIR/bench_compress_minibatch_vq.py" "$SCRIPT_DIR/ksubspaces_artifacts.py")
+ALLOCATOR_CODE=$(code_hash "$SCRIPT_DIR/first_order_rank_allocator.py" "$SCRIPT_DIR/ksubspaces_artifacts.py")
+CALIBRATE_CODE=$(code_hash "$SCRIPT_DIR/calibrate_codebooks_block_output.py" "$SCRIPT_DIR/ksubspaces_artifacts.py")
+INFERENCE_CODE=$(code_hash "$SCRIPT_DIR/bench_inference_minibatch_vq.py" "$SCRIPT_DIR/ksubspaces_artifacts.py")
+SPARSITY_CODE=$(code_hash "$SCRIPT_DIR/compare_magnitude_pruning.py" "$SCRIPT_DIR/bench_inference_minibatch_vq.py" "$SCRIPT_DIR/ksubspaces_artifacts.py")
+EXPORT_CODE=$(code_hash "$SCRIPT_DIR/export_model_weights.py")
+
+# =========================================================== 1. fetch
+FETCH_DIR="$MODEL_CACHE/fetch"
+fetch_stage() {
+  "$PYTHON" "$SCRIPT_DIR/arks_fetch.py" --model "$MODEL" ${HF_REVISION:+--revision "$HF_REVISION"} \
+    --info-json "$FETCH_DIR/fetch_info.json"
+}
+echo
+echo "== Stage: fetch =="
+run_stage fetch "$FETCH_DIR" "$(hash_of "fetch|$MODEL|$HF_REVISION")" fetch_stage "model=$MODEL revision=$HF_REVISION"
+
+# =========================================================== 2. export
+export_stage() {
+  "$PYTHON" "$SCRIPT_DIR/export_model_weights.py" --model "$MODEL" --output-dir "$WEIGHT_DIR" --dtype float16
+  local count
+  count=$(find "$WEIGHT_DIR" -maxdepth 1 -name 'layer_*_weight.npy' | wc -l)
+  if [[ "$count" -ne "$EXPECTED_MATRICES" ]]; then
+    echo "Export produced $count weight matrices; the model configuration implies $EXPECTED_MATRICES." >&2
+    return 1
+  fi
+  echo "Exported $count weight matrices (expected $EXPECTED_MATRICES from the model configuration)."
+}
+echo
+echo "== Stage: export =="
+run_stage export "$WEIGHT_DIR" "$(hash_of "export|$MODEL|float16|$EXPORT_CODE|$(stamp_hash "$FETCH_DIR")")" export_stage "fetch=$(stamp_hash "$FETCH_DIR")"
+WEIGHT_MANIFEST_HASH=$([[ -f "$WEIGHT_DIR/manifest.json" ]] && sha256sum "$WEIGHT_DIR/manifest.json" | cut -c1-16 || echo "missing")
+
+# =========================================================== 3. profile
+SHARED_DIR="$RUN_DIR/shared"
+PROFILE_ROOT="$SHARED_DIR/rank_profile"
+PROFILE_DIR="$PROFILE_ROOT/sp_1.00_K${K}_R${MAX_RANK}_B8_C${C}_W${TILE_WIDTH}"
+profile_stage() {
+  "$PYTHON" "$SCRIPT_DIR/bench_compress_minibatch_vq.py" \
+    --model "$MODEL" --input-dir "$WEIGHT_DIR" --weight-scope all \
+    --k "$K" --ranks "$MAX_RANK" --coefficient-bits 8 --coefficient-encoding scalar \
+    --tile-width "$TILE_WIDTH" --sparsity 1.0 --sample-size "$SAMPLE_SIZE" \
+    --iterations "$ITERATIONS" --batch-size "$BATCH_SIZE" --selection-pool "$SELECTION_POOL" \
+    --seed "$SEED" --output-root "$PROFILE_ROOT" --C "$C" \
+    --workers "$WORKERS" --threads-per-worker "$THREADS_PER_WORKER"
+  local count
+  count=$(find "$PROFILE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'layer_*' | wc -l)
+  [[ "$count" -eq "$EXPECTED_MATRICES" ]] || { echo "Profile has $count matrices, expected $EXPECTED_MATRICES" >&2; return 1; }
+}
+PROFILE_HASH=$(hash_of "profile|$MODEL|$WEIGHT_MANIFEST_HASH|K=$K|R=$MAX_RANK|C=$C|W=$TILE_WIDTH|SS=$SAMPLE_SIZE|IT=$ITERATIONS|BS=$BATCH_SIZE|SP=$SELECTION_POOL|SEED=$SEED|code=$COMPRESS_CODE")
+echo
+echo "== Stage: profile (rank-$MAX_RANK K-subspaces profile shared by all experiments) =="
+run_stage profile "$PROFILE_ROOT" "$PROFILE_HASH" profile_stage "weights=$WEIGHT_MANIFEST_HASH"
+
+# =========================================================== 4. allocate
+ALLOCATION_DIR="$SHARED_DIR/rank_allocation"
+OVERRIDES_FILE="$ALLOCATION_DIR/rank_override_arguments.txt"
+allocate_stage() {
+  "$PYTHON" "$SCRIPT_DIR/first_order_rank_allocator.py" \
+    --model "$MODEL" --max-rank-artifact-dir "$PROFILE_DIR" \
+    --base-rank "$BASE_RANK" --max-rank "$MAX_RANK" --extra-budget-mb "$EXTRA_BUDGET_MB" \
+    --calibration-samples "$RANK_CALIBRATION_SAMPLES" --seqlen "$RANK_CALIBRATION_SEQLEN" \
+    --weight-scope all --device "$DEVICE" --seed "$SEED" --output-dir "$ALLOCATION_DIR"
+  [[ -s "$OVERRIDES_FILE" ]] || { echo "Missing rank-override file: $OVERRIDES_FILE" >&2; return 1; }
+}
+ALLOCATION_HASH=$(hash_of "allocate|$(stamp_hash "$PROFILE_ROOT")|BR=$BASE_RANK|MR=$MAX_RANK|B=$EXTRA_BUDGET_MB|S=$RANK_CALIBRATION_SAMPLES|L=$RANK_CALIBRATION_SEQLEN|SEED=$SEED|DEV=$DEVICE|code=$ALLOCATOR_CODE")
+echo
+echo "== Stage: allocate (first-order adaptive rank allocation) =="
+run_stage allocate "$ALLOCATION_DIR" "$ALLOCATION_HASH" allocate_stage "profile=$(stamp_hash "$PROFILE_ROOT")"
+if [[ $DRY_RUN -eq 0 ]]; then
+  read -r -a RANK_ARGS < "$OVERRIDES_FILE"
+else
+  RANK_ARGS=()
+fi
+
+# ===================================================== 5. per-experiment
+compress_hash_for() {
+  local experiment="$1" representation bits extra=""
+  representation=$(experiment_representation "$experiment")
+  bits=$(experiment_bits "$experiment")
+  if [[ "$representation" == "vq" ]]; then
+    extra="|CB=$CODEBOOK_SIZE|ST=$VQ_STAGES|VQSS=$VQ_SAMPLE_SIZE"
+  fi
+  hash_of "compress|$(stamp_hash "$ALLOCATION_DIR")|$WEIGHT_MANIFEST_HASH|K=$K|R=$BASE_RANK|C=$C|W=$TILE_WIDTH|REP=$representation|BITS=$bits$extra|SS=$SAMPLE_SIZE|IT=$ITERATIONS|BS=$BATCH_SIZE|SP=$SELECTION_POOL|SEED=$SEED|code=$COMPRESS_CODE"
+}
+
+artifact_pattern_for() {
+  local experiment="$1" bits
+  bits=$(experiment_bits "$experiment")
+  if [[ "$(experiment_representation "$experiment")" == "vq" ]]; then
+    echo "sp_1.00_K${K}_R${BASE_RANK}*_B${bits}_C${C}*_W${TILE_WIDTH}_CVQ${VQ_STAGES}x${CODEBOOK_SIZE}*"
+  else
+    echo "sp_1.00_K${K}_R${BASE_RANK}*_B${bits}_C${C}*_W${TILE_WIDTH}"
+  fi
+}
+
+CURRENT_EXPERIMENT=""
+compress_stage() {
+  local experiment="$CURRENT_EXPERIMENT" representation bits dir artifact_root
+  representation=$(experiment_representation "$experiment")
+  bits=$(experiment_bits "$experiment")
+  dir=$(experiment_dir "$experiment")
+  artifact_root="$dir/artifacts"
+
+  # A calibrated VQ run starts from exactly the artifacts of the uncalibrated
+  # VQ run; copying them is bitwise identical to recompressing them.
+  if [[ "$experiment" == "vq_calibrated" ]]; then
+    local source_root; source_root="$(experiment_dir vq_nocalib)/artifacts"
+    if "$PYTHON" "$SCRIPT_DIR/arks_stamp.py" check "$source_root" "$(compress_hash_for vq_nocalib)" \
+       && [[ "$(stamp_get "$source_root" calibrated)" != "true" ]]; then
+      echo "Copying uncalibrated VQ artifacts from $source_root"
+      cp -r "$source_root"/. "$artifact_root"/
+      rm -f "$artifact_root/.arks_stage.json"
+      "$PYTHON" "$SCRIPT_DIR/arks_stamp.py" begin "$artifact_root" --stage "compress_$experiment" \
+        --hash "$(compress_hash_for "$experiment")" --inputs "copied_from=$source_root"
+      return 0
+    fi
+  fi
+
+  local -a representation_args=()
+  if [[ "$representation" == "vq" ]]; then
+    representation_args+=(--coefficient-codebook-size "$CODEBOOK_SIZE" --coefficient-vq-stages "$VQ_STAGES" --coefficient-vq-sample-size "$VQ_SAMPLE_SIZE")
+  fi
+  "$PYTHON" "$SCRIPT_DIR/bench_compress_minibatch_vq.py" \
+    --model "$MODEL" --sparsity 1.0 --k "$K" --ranks "$BASE_RANK" \
+    --coefficient-bits "$bits" --coefficient-encoding "$representation" \
+    --C "$C" --tile-width "$TILE_WIDTH" "${RANK_ARGS[@]}" "${representation_args[@]}" \
+    --input-dir "$WEIGHT_DIR" --output-root "$artifact_root" --weight-scope all \
+    --sample-size "$SAMPLE_SIZE" --iterations "$ITERATIONS" --batch-size "$BATCH_SIZE" \
+    --selection-pool "$SELECTION_POOL" --seed "$SEED" \
+    --workers "$WORKERS" --threads-per-worker "$THREADS_PER_WORKER"
+  local config_dir count
+  config_dir=$(find_config_dir "$artifact_root" "$(artifact_pattern_for "$experiment")")
+  count=$(find "$config_dir" -mindepth 1 -maxdepth 1 -type d -name 'layer_*' | wc -l)
+  [[ "$count" -eq "$EXPECTED_MATRICES" ]] || { echo "Found $count matrix artifacts, expected $EXPECTED_MATRICES" >&2; return 1; }
+  cp -r "$ALLOCATION_DIR" "$dir/rank_allocation"
+}
+
+calibrate_stage() {
+  local dir artifact_root config_dir result_dir
+  dir=$(experiment_dir vq_calibrated)
+  artifact_root="$dir/artifacts"
+  config_dir=$(find_config_dir "$artifact_root" "$(artifact_pattern_for vq_calibrated)")
+  result_dir="$dir/calibration"
+  # An interrupted calibration leaves its rollback backup behind and may have
+  # written calibrated codebooks for the first blocks. Restore the pristine
+  # artifacts from that backup before calibrating again.
+  if [[ -d "$dir/calibration_backup" ]]; then
+    echo "Restoring artifacts from the interrupted calibration backup"
+    "$PYTHON" - "$config_dir" "$dir/calibration_backup" <<'PY'
+import shutil, sys
+from pathlib import Path
+artifact_dir, backup_dir = Path(sys.argv[1]), Path(sys.argv[2])
+restored = 0
+for layer_backup in sorted(backup_dir.glob("layer_*")):
+    for source in layer_backup.iterdir():
+        if source.is_file():
+            shutil.copy2(source, artifact_dir / layer_backup.name / source.name)
+            restored += 1
+print(f"restored {restored} files")
+PY
+    rm -rf "$dir/calibration_backup"
+  fi
+  local -a safety_args=()
+  if [[ "$CALIBRATION_SEQUENTIAL_INPUTS" == "1" ]]; then safety_args+=(--sequential-inputs); else safety_args+=(--no-sequential-inputs); fi
+  if [[ "$CALIBRATION_STREAMING" == "on" ]]; then safety_args+=(--streaming-blocks); else safety_args+=(--no-streaming-blocks); fi
+  safety_args+=(--model-staging "$MODEL_STAGING")
+  if [[ "$LOSS_CHUNK_TOKENS" != "0" ]]; then safety_args+=(--loss-chunk-tokens "$LOSS_CHUNK_TOKENS"); fi
+  "$PYTHON" "$SCRIPT_DIR/calibrate_codebooks_block_output.py" \
+    --model "$MODEL" --artifact-dir "$config_dir" \
+    --samples "$CALIBRATION_SAMPLES" --seqlen "$CALIBRATION_SEQLEN" --epochs "$CALIBRATION_EPOCHS" \
+    --batch-size "$CALIBRATION_BATCH_SIZE" --early-stop "$CALIBRATION_EARLY_STOP" --steps "$CALIBRATION_STEPS" \
+    --lr "$CALIBRATION_LR" --seed "$SEED" --validation-samples "$CALIBRATION_VALIDATION_SAMPLES" \
+    --reassign-every "$CALIBRATION_REASSIGN_EVERY" --reassignment-batch-size "$CALIBRATION_REASSIGN_BATCH_SIZE" \
+    --max-coefficient-mse-ratio "$CALIBRATION_MAX_COEFFICIENT_MSE_RATIO" \
+    --ppl-guard-samples "$CALIBRATION_PPL_GUARD_SAMPLES" --ppl-guard-seqlen "$CALIBRATION_PPL_GUARD_SEQLEN" \
+    --ppl-guard-split "$CALIBRATION_PPL_GUARD_SPLIT" --ppl-guard-tolerance "$CALIBRATION_PPL_GUARD_TOLERANCE" \
+    --device "$DEVICE" --backup-dir "$dir/calibration_backup" \
+    --output-csv "$result_dir/block_codebook_calibration.csv" "${safety_args[@]}"
+  mkdir -p "$dir/results"
+  cp "$result_dir/block_codebook_calibration.csv" "$dir/results/block_codebook_calibration.csv"
+  "$PYTHON" "$SCRIPT_DIR/arks_stamp.py" set "$artifact_root" calibrated=true
+}
+
+inference_stage() {
+  local experiment="$CURRENT_EXPERIMENT" representation bits dir artifact_root result_dir
+  representation=$(experiment_representation "$experiment")
+  bits=$(experiment_bits "$experiment")
+  dir=$(experiment_dir "$experiment")
+  artifact_root="$dir/artifacts"
+  result_dir="$dir/results"
+  local -a representation_args=() chunk_args=()
+  if [[ "$representation" == "vq" ]]; then
+    representation_args+=(--coefficient-codebook-size "$CODEBOOK_SIZE" --coefficient-vq-stages "$VQ_STAGES")
+  fi
+  if [[ "$LOSS_CHUNK_TOKENS" != "0" ]]; then chunk_args+=(--loss-chunk-tokens "$LOSS_CHUNK_TOKENS"); fi
+  "$PYTHON" "$SCRIPT_DIR/bench_inference_minibatch_vq.py" \
+    --model "$MODEL" --sparsity 1.0 --k "$K" --ranks "$BASE_RANK" \
+    --coefficient-bits "$bits" --coefficient-encoding "$representation" \
+    --C "$C" --tile-width "$TILE_WIDTH" "${RANK_ARGS[@]}" "${representation_args[@]}" \
+    --artifact-root "$artifact_root" --original-dir "$WEIGHT_DIR" --result-dir "$result_dir" \
+    --device "$DEVICE" --seqlen "$INFERENCE_SEQLEN" --batch-size 1 \
+    --max-ppl-samples "$MAX_PPL_SAMPLES" --targets all \
+    --dense-ppl-cache "$DENSE_PPL_CACHE" "${chunk_args[@]}"
+}
+
+sparsity_stage() {
+  local source_dir source_bits dir result_dir sensitivity_json
+  dir=$(experiment_dir sparsity)
+  result_dir="$dir/results"
+  if [[ "$SPARSITY_SOURCE" == "fp16" ]]; then source_dir=$(experiment_dir fp16); source_bits=16; else source_dir=$(experiment_dir int8); source_bits=8; fi
+  sensitivity_json="$ALLOCATION_DIR/selected_first_order_ranks.json"
+  local -a args=(
+    --model "$MODEL" --artifact-root "$source_dir/artifacts" --adaptive-coeff-pruning
+    --sensitivity-json "$sensitivity_json"
+    --sensitive-coeff-sparsity "$SENSITIVE_COEFF_SPARSITY" --robust-coeff-sparsity "$ROBUST_COEFF_SPARSITY"
+    --coefficient-value-bits "$source_bits" --seqlen "$INFERENCE_SEQLEN" --max-ppl-samples "$MAX_PPL_SAMPLES"
+    --device "$DEVICE" --skip-direct-weight --output-csv "$result_dir/adaptive_sparsity.csv"
+    --dense-ppl-cache "$DENSE_PPL_CACHE"
+  )
+  if [[ "$LOSS_CHUNK_TOKENS" != "0" ]]; then args+=(--loss-chunk-tokens "$LOSS_CHUNK_TOKENS"); fi
+  local x
+  if [[ -n "$SENSITIVE_MATRICES" ]]; then for x in $SENSITIVE_MATRICES; do args+=(--sensitive-matrix "$x"); done; fi
+  if [[ -n "$COEFF_SPARSITY_OVERRIDES" ]]; then for x in $COEFF_SPARSITY_OVERRIDES; do args+=(--coeff-sparsity-override "$x"); done; fi
+  "$PYTHON" "$SCRIPT_DIR/compare_magnitude_pruning.py" "${args[@]}"
+}
+
+INFERENCE_PARAMS="L=$INFERENCE_SEQLEN|N=$MAX_PPL_SAMPLES|DEV=$DEVICE|CHUNK=$LOSS_CHUNK_TOKENS|code=$INFERENCE_CODE"
+CALIBRATION_PARAMS="S=$CALIBRATION_SAMPLES|L=$CALIBRATION_SEQLEN|E=$CALIBRATION_EPOCHS|B=$CALIBRATION_BATCH_SIZE|ES=$CALIBRATION_EARLY_STOP|ST=$CALIBRATION_STEPS|LR=$CALIBRATION_LR|V=$CALIBRATION_VALIDATION_SAMPLES|RE=$CALIBRATION_REASSIGN_EVERY|RB=$CALIBRATION_REASSIGN_BATCH_SIZE|MR=$CALIBRATION_MAX_COEFFICIENT_MSE_RATIO|SI=$CALIBRATION_SEQUENTIAL_INPUTS|G=$CALIBRATION_PPL_GUARD_SAMPLES|GL=$CALIBRATION_PPL_GUARD_SEQLEN|GS=$CALIBRATION_PPL_GUARD_SPLIT|GT=$CALIBRATION_PPL_GUARD_TOLERANCE|SEED=$SEED|DEV=$DEVICE|STREAM=$CALIBRATION_STREAMING|STAGE=$MODEL_STAGING|CHUNK=$LOSS_CHUNK_TOKENS|code=$CALIBRATE_CODE"
+
+run_experiment_pipeline() {
+  local experiment="$1" dir artifact_root
+  dir=$(experiment_dir "$experiment")
+  artifact_root="$dir/artifacts"
+  CURRENT_EXPERIMENT="$experiment"
+  echo
+  echo "== Experiment: $experiment -> $dir =="
+  local compress_hash; compress_hash=$(compress_hash_for "$experiment")
+  if [[ "$experiment" == "vq_calibrated" ]]; then
+    # Calibration edits the artifacts in place, so its configuration is part
+    # of the artifact stage identity: a changed calibration setting rebuilds
+    # (copies) pristine artifacts before calibrating again.
+    compress_hash=$(hash_of "$compress_hash|calib=$CALIBRATION_PARAMS")
+  fi
+  run_stage "compress_$experiment" "$artifact_root" "$compress_hash" compress_stage "allocation=$(stamp_hash "$ALLOCATION_DIR")"
+  if [[ "$experiment" == "vq_calibrated" ]]; then
+    local calibration_hash; calibration_hash=$(hash_of "calibrate|$(stamp_hash "$artifact_root")|$CALIBRATION_PARAMS")
+    run_stage "calibrate_$experiment" "$dir/calibration" "$calibration_hash" calibrate_stage "artifacts=$(stamp_hash "$artifact_root")"
+    local inference_hash; inference_hash=$(hash_of "inference|$(stamp_hash "$dir/calibration")|$INFERENCE_PARAMS")
+    run_stage "inference_$experiment" "$dir/results" "$inference_hash" inference_stage "calibration=$(stamp_hash "$dir/calibration")"
+    if [[ $DRY_RUN -eq 0 && -f "$dir/calibration/block_codebook_calibration.csv" && ! -f "$dir/results/block_codebook_calibration.csv" ]]; then
+      cp "$dir/calibration/block_codebook_calibration.csv" "$dir/results/"
+    fi
+  else
+    local inference_hash; inference_hash=$(hash_of "inference|$(stamp_hash "$artifact_root")|$INFERENCE_PARAMS")
+    run_stage "inference_$experiment" "$dir/results" "$inference_hash" inference_stage "artifacts=$(stamp_hash "$artifact_root")"
+  fi
+}
+
+for experiment in "${EXPERIMENT_LIST[@]}"; do
+  case "$experiment" in
+    fp16|int8|vq_nocalib) run_experiment_pipeline "$experiment" ;;
+    vq_calibrated)
+      # Reuse the uncalibrated artifacts when that experiment is selected too.
+      if has_experiment vq_nocalib; then :; fi
+      run_experiment_pipeline vq_calibrated ;;
+    sparsity)
+      # The source representation must exist; build it if it was not selected.
+      if ! has_experiment "$SPARSITY_SOURCE"; then
+        CURRENT_EXPERIMENT="$SPARSITY_SOURCE"
+        echo
+        echo "== Sparsity source: building $SPARSITY_SOURCE artifacts =="
+        run_stage "compress_$SPARSITY_SOURCE" "$(experiment_dir "$SPARSITY_SOURCE")/artifacts" "$(compress_hash_for "$SPARSITY_SOURCE")" compress_stage "allocation=$(stamp_hash "$ALLOCATION_DIR")"
+      fi
+      echo
+      echo "== Experiment: sparsity -> $(experiment_dir sparsity) =="
+      SPARSITY_HASH=$(hash_of "sparsity|$(stamp_hash "$(experiment_dir "$SPARSITY_SOURCE")/artifacts")|$(stamp_hash "$ALLOCATION_DIR")|SRC=$SPARSITY_SOURCE|S=$SENSITIVE_COEFF_SPARSITY|R=$ROBUST_COEFF_SPARSITY|O=$COEFF_SPARSITY_OVERRIDES|M=$SENSITIVE_MATRICES|$INFERENCE_PARAMS|code=$SPARSITY_CODE")
+      run_stage sparsity "$(experiment_dir sparsity)/results" "$SPARSITY_HASH" sparsity_stage "source=$SPARSITY_SOURCE"
+      ;;
+  esac
+done
+
+# =========================================================== 6. summary
+echo
+echo "== Stage status =="
+for name in "${!STAGE_STATUS[@]}"; do printf '  %-28s %s\n' "$name" "${STAGE_STATUS[$name]}"; done | sort
+if [[ $DRY_RUN -eq 0 ]]; then
+  "$PYTHON" "$SCRIPT_DIR/arks_summary.py" --run-dir "$RUN_DIR"
+fi
+echo
+echo "ARKS pipeline finished $(date)"
+echo "Run directory: $RUN_DIR"
+echo "Log: $LOG_FILE"

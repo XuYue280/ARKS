@@ -1,0 +1,96 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+
+# pytest
+.pytest_cache/
+
+# ---------------------------------------------------------------------------
+# Credentials -- never commit these
+# ---------------------------------------------------------------------------
+.hf_token
+.hf_home/
+*.token
+.env
+
+# ---------------------------------------------------------------------------
+# Run outputs and caches. arks_runs/ is ~394 GB and arks_cache/ ~353 GB on the
+# cluster: every compressed artifact, token cache and per-corpus inference
+# record lives there. All of it is reproducible from run.sh, so none of it
+# belongs in git.
+# ---------------------------------------------------------------------------
+arks_runs/
+arks_cache/
+results/
+data/
+logs/
+
+# Harvested results and figures -- regenerate with tools/plot_results.py
+# and the plot/ scripts rather than tracking them.
+results_summary.csv
+arks_results.*
+plot/
+
+# ---------------------------------------------------------------------------
+# Large binary artifacts, wherever they land
+# ---------------------------------------------------------------------------
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.npy
+*.npz
+*.h5
+*.gz
+*.tar
+*.zip
+
+# Figures and harvested tables produced by any run
+*.png
+*.pdf
+*.svg
+
+# ---------------------------------------------------------------------------
+# More generated output. *.json and *.txt are deliberately NOT blanket rules:
+# arks_all_results.json is the tracked harvest, and the tracked .txt files are
+# requirements.txt and models_list.txt. Ignoring a path that holds a tracked
+# file keeps the file tracked but makes later edits to it invisible to
+# git status, so per-run output is excluded by location or exact name instead.
+# ---------------------------------------------------------------------------
+plots/
+figures/
+tmp/
+scratch/
+.probe/
+
+*.csv
+*.jsonl
+*.pkl
+
+# Slurm output that lands outside $LOG_DIR when -o/-e are not passed.
+slurm-*.out
+slurm-*.err
+nohup.out
+
+# ---------------------------------------------------------------------------
+# Crash artifacts. A core dump holds whatever was in memory at the time --
+# this repo has already produced one containing the HF token in plaintext.
+# ---------------------------------------------------------------------------
+core.*
+*.core
+
+# ---------------------------------------------------------------------------
+# Scratch copies made while patching. run.sh.pre_smallmodels was created by
+# hand and had to be moved out of the tree before committing; these patterns
+# stop the next one from being staged by accident.
+# ---------------------------------------------------------------------------
+*.bak
+*.bak[0-9]
+*.orig
+*.pre_*
+*.pre[0-9]
+.probe_*.py
