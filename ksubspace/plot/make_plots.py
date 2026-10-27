@@ -49,6 +49,7 @@ MODELS = [
     ("opt-13b", "OPT-13B", "opt"),
     ("opt-30b", "OPT-30B", "opt"),
     ("opt-66b", "OPT-66B", "opt"),
+    ("Llama-3.2-1B", "Llama-3.2-1B", "llama"),
     ("Llama-3.1-8B", "Llama-3.1-8B", "llama"),
     ("Llama-3.1-70B", "Llama-3.1-70B", "llama"),
 ]

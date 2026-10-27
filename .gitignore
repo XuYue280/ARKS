@@ -1,0 +1,53 @@
+# ---------------------------------------------------------------------------
+# This repo is a snapshot of the ARKS plots. Everything it holds except
+# make_plots.py is generated, so the rules below cover the whole tree.
+#
+# NOTE: .gitignore does not affect files git already tracks. The plot PNGs,
+# the data.csv files and the arks_cache token caches were committed before
+# these rules existed, so they keep showing up as "modified" until they are
+# untracked with `git rm --cached`. See the companion note from that change.
+# ---------------------------------------------------------------------------
+
+# Generated figures and the tables they are drawn from.
+# make_plots.py is the source and stays tracked.
+ksubspace/plot/**/*.png
+ksubspace/plot/**/*.pdf
+ksubspace/plot/**/*.svg
+ksubspace/plot/**/data.csv
+
+# Tokenizer caches: re-derived from the model + corpus on first use.
+arks_cache/
+arks_runs/
+
+# Hugging Face scratch state, including xet transfer logs.
+hf_home/
+.hf_home/
+
+# Credentials -- never commit these
+.hf_token
+*.token
+.env
+
+# Large binaries, wherever they land
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.npy
+*.npz
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Crash artefacts: a core dump holds whatever was in memory, including tokens.
+core.*
+*.core
+
+# Scratch copies made while patching
+*.bak
+*.orig
+*.pre_*
+.probe_*.py
